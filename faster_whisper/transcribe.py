@@ -92,6 +92,7 @@ class WhisperModel:
         num_workers: int = 1,
         download_root: Optional[str] = None,
         local_files_only: bool = False,
+        flash_attention: bool = False,
     ):
         """Initializes the Whisper model.
 
@@ -118,6 +119,7 @@ class WhisperModel:
             are saved in the standard Hugging Face cache directory.
           local_files_only:  If True, avoid downloading the file and return the path to the
             local cached file if it exists.
+          flash_attention: If True, run model with flash attention 2 for self-attention layer
         """
         self.logger = get_logger()
 
@@ -137,6 +139,7 @@ class WhisperModel:
             compute_type=compute_type,
             intra_threads=cpu_threads,
             inter_threads=num_workers,
+            flash_attention=flash_attention,
         )
 
         tokenizer_file = os.path.join(model_path, "tokenizer.json")
