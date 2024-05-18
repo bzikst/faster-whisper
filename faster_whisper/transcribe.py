@@ -91,9 +91,11 @@ class WhisperModel:
         compute_type: str = "default",
         cpu_threads: int = 0,
         num_workers: int = 1,
+        max_queued_batches: int = 0,
         download_root: Optional[str] = None,
         local_files_only: bool = False,
         flash_attention: bool = False,
+        tensor_parallel: bool = False,
         files: dict = None,
         **model_kwargs,
     ):
@@ -118,11 +120,15 @@ class WhisperModel:
             having multiple workers enables true parallelism when running the model
             (concurrent calls to self.model.generate() will run in parallel).
             This can improve the global throughput at the cost of increased memory usage.
+          max_queued_batches: Maximum numbers of batches in the worker queue (-1 for unlimited,
+            0 for an automatic value). When the queue is full, future requests will block
+            until a free slot is available.
           download_root: Directory where the models should be saved. If not set, the models
             are saved in the standard Hugging Face cache directory.
           local_files_only:  If True, avoid downloading the file and return the path to the
             local cached file if it exists.
           flash_attention: If True, run model with flash attention 2 for self-attention layer
+          tensor_parallel: If True, run model with tensor parallel mode
           files: Load model files from the memory. This argument is a dictionary mapping file names
             to file contents as file-like or bytes objects. If this is set, model_path acts as an
             identifier for this model.
@@ -143,6 +149,9 @@ class WhisperModel:
                 cache_dir=download_root,
             )
 
+        if flash_attention:
+            print('Initializing Whisper with flash_attention')
+
         self.model = ctranslate2.models.Whisper(
             model_path,
             device=device,
@@ -150,7 +159,9 @@ class WhisperModel:
             compute_type=compute_type,
             intra_threads=cpu_threads,
             inter_threads=num_workers,
+            max_queued_batches=max_queued_batches,
             flash_attention=flash_attention,
+            tensor_parallel=tensor_parallel,
             files=files,
             **model_kwargs,
         )
