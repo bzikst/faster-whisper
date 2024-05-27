@@ -1,15 +1,26 @@
+import hashlib
 import itertools
 import json
 import logging
 import os
+import random
+import urllib
 import zlib
 
+from collections import Counter, defaultdict
 from inspect import signature
 from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Tuple, Union
 
 import ctranslate2
+import jsons
 import numpy as np
 import tokenizers
+import torch
+
+from pyannote.audio import Model
+from tqdm import tqdm
+from transformers import Pipeline
+from transformers.pipelines.pt_utils import PipelineIterator
 
 from faster_whisper.audio import decode_audio, pad_or_trim
 from faster_whisper.feature_extractor import FeatureExtractor
@@ -18,8 +29,10 @@ from faster_whisper.utils import download_model, format_timestamp, get_end, get_
 from faster_whisper.vad import (
     SpeechTimestampsMap,
     VadOptions,
+    VoiceActivitySegmentation,
     collect_chunks,
     get_speech_timestamps,
+    merge_chunks,
 )
 
 
@@ -44,6 +57,21 @@ class Segment(NamedTuple):
     words: Optional[List[Word]]
 
 
+class BatchedSegment(NamedTuple):
+    """
+    A single segment in batched transcription (up to multiple sentences) of a speech.
+
+    start (float): Start time in seconds.
+    end (float): End time in seconds.
+    text (str): transcription of the segment.
+    """
+
+    start: float
+    end: float
+    text: str
+
+
+# Added additional parameters for multilingual videos and fixes below
 class TranscriptionOptions(NamedTuple):
     beam_size: int
     best_of: int
@@ -52,6 +80,7 @@ class TranscriptionOptions(NamedTuple):
     repetition_penalty: float
     no_repeat_ngram_size: int
     log_prob_threshold: Optional[float]
+    log_prob_low_threshold: Optional[float]  # New parameter
     no_speech_threshold: Optional[float]
     compression_ratio_threshold: Optional[float]
     condition_on_previous_text: bool
@@ -66,6 +95,8 @@ class TranscriptionOptions(NamedTuple):
     word_timestamps: bool
     prepend_punctuations: str
     append_punctuations: str
+    multilingual: bool  # New parameter
+    output_language: str  # New parameter
     max_new_tokens: Optional[int]
     clip_timestamps: Union[str, List[float]]
     hallucination_silence_threshold: Optional[float]
@@ -82,6 +113,530 @@ class TranscriptionInfo(NamedTuple):
     vad_options: VadOptions
 
 
+# The code below is copied from whisper-x (https://github.com/m-bain/whisperX)
+# and adapted for faster_whisper
+
+
+class BatchedInferencePipeline(Pipeline):
+
+    """
+    Huggingface Pipeline wrapper for WhisperModel.
+    Copyright (c) 2022, Max Bain
+    All rights reserved.
+    Modified by Mobius Labs GmbH
+    """
+
+    # TODO:
+    # - add support for timestamp mode
+    # - add support for custom inference kwargs
+
+    def __init__(
+        self,
+        model,
+        use_vad_model: bool = True,
+        options: Optional[NamedTuple] = None,
+        tokenizer=None,
+        device: Union[int, str, "torch.device"] = -1,
+        vad_device: Union[int, str, "torch.device"] = "auto",
+        framework="pt",
+        language: Optional[str] = None,
+        **kwargs,
+    ):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.options = options
+        self.preset_language = language
+        self._batch_size = kwargs.pop("batch_size", None)
+        self._num_workers = 1
+        self.use_vad_model = use_vad_model
+        self.vad_onset = 0.500
+        self.vad_offset = 0.363
+        self.vad_model_url = (
+            "https://whisperx.s3.eu-west-2.amazonaws.com/model_weights/segmentation"
+            "/0b5b3216d60a2d32fc086b47ea8c67589aaeb26b7e07fcbe620d6d0b83e209ea/pytorch_model.bin"
+        )
+        (
+            self._preprocess_params,
+            self._forward_params,
+            self._postprocess_params,
+        ) = self._sanitize_parameters(**kwargs)
+        self.call_count = 0
+        self.framework = framework
+        if self.framework == "pt":
+            self.device = self.get_device(device)
+        else:
+            self.device = device
+
+        if self.use_vad_model:
+            self.vad_device = self.get_device(vad_device)
+
+            # load vad model and perform VAD preprocessing if needed
+            self.vad_model = self.load_vad_model(
+                vad_onset=self.vad_onset, vad_offset=self.vad_offset
+            )
+        self.chunk_size = 30  # VAD merging size
+
+        super(Pipeline, self).__init__()
+
+    def _sanitize_parameters(self, **kwargs):
+        preprocess_kwargs = {}
+        if "tokenizer" in kwargs:
+            preprocess_kwargs["maybe_arg"] = kwargs["maybe_arg"]
+        return preprocess_kwargs, {}, {}
+
+    def get_device(self, device: Union[int, str, "torch.device"]):
+        """
+        Converts the input device into a torch.device object.
+
+        The input can be an integer, a string, or a `torch.device` object.
+
+        The function handles a special case where the input device is "auto".
+        When "auto" is specified, the device will default to the
+        device of the model (self.model.device). If the model's device is also "auto",
+        it selects "cuda" if a CUDA-capable device is available; otherwise, it selects "cpu".
+        """
+        if isinstance(device, torch.device):
+            return device
+        elif isinstance(device, str):
+            if device == "auto" and self.model.device == "auto":
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            elif device == "auto":
+                device = self.model.device
+            return torch.device(device)
+        elif device < 0:
+            return torch.device("cpu")
+        else:
+            return torch.device(f"cuda:{device}")
+
+    def preprocess(self, audio, enable_ta_fe=True):
+        audio = audio["inputs"]
+        features = torch.tensor(
+            self.model.feature_extractor(audio, enable_ta=enable_ta_fe, padding=True)[
+                :, : self.model.feature_extractor.nb_max_frames
+            ]
+        )
+        return {"inputs": features}
+
+    def _forward(self, model_inputs, **forward_params):
+        outputs = self.model.generate_segment_batched(
+            model_inputs["inputs"], self.tokenizer, forward_params
+        )
+        return {"text": outputs}
+
+    def __call__(
+        self, inputs, options, enable_ta_fe, num_workers=None, batch_size=None, **kwargs
+    ):
+        if num_workers is None:
+            if self._num_workers is None:
+                num_workers = 0
+            else:
+                num_workers = self._num_workers
+        if batch_size is None:
+            if self._batch_size is None:
+                batch_size = 1
+            else:
+                batch_size = self._batch_size
+
+        (
+            preprocess_params,
+            forward_params,
+            postprocess_params,
+        ) = self._sanitize_parameters(**kwargs)
+        # Fuse __init__ params and __call__ params without modifying the __init__ ones.
+        preprocess_params = {
+            **self._preprocess_params,
+            **preprocess_params,
+            "enable_ta_fe": enable_ta_fe,
+        }
+        options_dict = jsons.dump(options)
+        forward_params = {**self._forward_params, **forward_params, **options_dict}
+        postprocess_params = {**self._postprocess_params, **postprocess_params}
+
+        self.call_count += 1
+        if (
+            self.call_count > 10
+            and self.framework == "pt"
+            and self.device.type == "cuda"
+        ):
+            logging.warning(
+                "You seem to be using the pipelines sequentially on GPU. Please use a Dataset"
+            )
+
+        return self.get_iterator(
+            inputs,
+            num_workers,
+            batch_size,
+            preprocess_params,
+            forward_params,
+            postprocess_params,
+        )
+
+    def postprocess(self, model_outputs):
+        return model_outputs
+
+    def get_iterator(
+        self,
+        inputs,
+        num_workers: int,
+        batch_size: int,
+        preprocess_params=None,
+        forward_params=None,
+        postprocess_params=None,
+    ):
+        def stack(items):
+            return {"inputs": torch.stack([x["inputs"] for x in items])}
+
+        if "TOKENIZERS_PARALLELISM" not in os.environ:
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        # TODO hack by collating feature_extractor and image_processor
+        dataset = PipelineIterator(inputs, self.preprocess, preprocess_params)
+        dataloader = torch.utils.data.DataLoader(
+            dataset, num_workers=num_workers, batch_size=batch_size, collate_fn=stack
+        )
+        model_iterator = PipelineIterator(
+            dataloader, self.forward, forward_params, loader_batch_size=batch_size
+        )
+        final_iterator = PipelineIterator(
+            model_iterator, self.postprocess, postprocess_params
+        )
+        return final_iterator
+
+    def get_language_and_tokenizer(self, audio, task=None, language=None):
+        language_probability = 1.0
+        if self.tokenizer is None:
+            if not language:
+                language, language_probability = self.detect_language(audio)
+            task = task or "transcribe"
+            self.tokenizer = Tokenizer(
+                self.model.hf_tokenizer,
+                self.model.model.is_multilingual,
+                task=task,
+                language=language,
+            )
+        else:
+            language = language or self.tokenizer.language_code
+            task = task or self.tokenizer.task
+            if task != self.tokenizer.task or language != self.tokenizer.language_code:
+                self.tokenizer = Tokenizer(
+                    self.model.hf_tokenizer,
+                    self.model.model.is_multilingual,
+                    task=task,
+                    language=language,
+                )
+
+        return language, language_probability, task
+
+    def audio_split(self, audio, segments, sampling_rate):
+        "Returns splitted audio chunks as iterator"
+        for seg in segments:
+            f1 = int(seg["start"] * sampling_rate)
+            f2 = int(seg["end"] * sampling_rate)
+            yield {"inputs": audio[f1:f2]}
+
+    # The code below is adapted from whisper-x
+    def load_vad_model(self, vad_onset=0.500, vad_offset=0.363, use_auth_token=None):
+        model_dir = torch.hub._get_torch_home()
+        os.makedirs(model_dir, exist_ok=True)
+        model_fp = os.path.join(model_dir, "whisperx-vad-segmentation.bin")
+        if os.path.exists(model_fp) and not os.path.isfile(model_fp):
+            raise RuntimeError(f"{model_fp} exists and is not a regular file")
+
+        if not os.path.isfile(model_fp):
+            with urllib.request.urlopen(self.vad_model_url) as source, open(
+                model_fp, "wb"
+            ) as output:
+                with tqdm(
+                    total=int(source.info().get("Content-Length")),
+                    ncols=80,
+                    unit="iB",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                ) as loop:
+                    while True:
+                        buffer = source.read(8192)
+                        if not buffer:
+                            break
+
+                        output.write(buffer)
+                        loop.update(len(buffer))
+
+        model_bytes = open(model_fp, "rb").read()
+        if hashlib.sha256(model_bytes).hexdigest() != self.vad_model_url.split("/")[-2]:
+            raise RuntimeError(
+                "Model SHA256 checksum does not not match. Please retry loading the model."
+            )
+
+        # or use silero VAD
+        vad_model = Model.from_pretrained(model_fp, use_auth_token=use_auth_token)
+        hyperparameters = {
+            "onset": vad_onset,
+            "offset": vad_offset,
+            "min_duration_on": 0.1,
+            "min_duration_off": 0.1,
+        }
+
+        vad_pipeline = VoiceActivitySegmentation(
+            segmentation=vad_model, device=torch.device(self.vad_device)
+        )
+        vad_pipeline.instantiate(hyperparameters)
+        return vad_pipeline
+
+    def transcribe(
+        self,
+        audio: Union[str, np.ndarray],
+        vad_segments: Optional[List[dict]] = None,
+        batch_size: int = 16,
+        num_workers: int = 0,
+        language: Optional[str] = None,
+        task: str = None,
+        log_progress: bool = False,
+        beam_size: int = 5,
+        best_of: int = 5,
+        patience: float = 1,
+        length_penalty: float = 1,
+        repetition_penalty: float = 1,
+        no_repeat_ngram_size: int = 0,
+        temperature: Union[float, List[float], Tuple[float, ...]] = [
+            0.0,
+            0.2,
+            0.4,
+            0.6,
+            0.8,
+            1.0,
+        ],
+        compression_ratio_threshold: Optional[float] = 2.4,
+        log_prob_threshold: Optional[float] = -1.0,
+        log_prob_low_threshold: Optional[float] = -2.0,
+        no_speech_threshold: Optional[float] = 0.6,
+        initial_prompt: Optional[Union[str, Iterable[int]]] = None,
+        prefix: Optional[str] = None,
+        suppress_blank: bool = True,
+        suppress_tokens: Optional[List[int]] = [-1],
+        enable_ta_fe=True,
+        prepend_punctuations: str = "\"'“¿([{-",
+        append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
+        max_new_tokens: Optional[int] = None,
+        clip_timestamps: Union[str, List[float]] = "0",
+        hotwords: Optional[str] = None,
+    ) -> Tuple[Iterable[BatchedSegment], TranscriptionInfo]:
+        """transcribe audio in chunks in batched fashion and return with language info.
+
+        Arguments:
+            audio: audio file as numpy array/path for batched transcription.
+            vad_segments: Optionally provide list of dictionaries each containing "start" and
+                "end" keys, specifying the start and end voiced regions of audio chunks.
+                If no vad_segments specified, it uses vad model automatically segment them.
+            batch_size: the maximum number of parallel requests to model for decoding.
+            num_workers: to enable true parallelism when running the model,
+                same as the transcribe function argument in WhisperModel class.
+            language: The language spoken in the audio.
+            task: either "transcribe" or "translate".
+            log_progress: whether to show progress bar or not.
+            beam_size: Beam size to use for decoding.
+            best_of: Number of candidates when sampling with non-zero temperature.
+            patience: Beam search patience factor.
+            length_penalty: Exponential length penalty constant.
+            repetition_penalty: Penalty applied to the score of previously generated tokens
+                (set > 1 to penalize).
+            no_repeat_ngram_size: Prevent repetitions of ngrams with this size (set 0 to disable).
+            temperature: Temperature for sampling. It can be a tuple of temperatures,
+                which will be successively used upon failures according to either
+                `compression_ratio_threshold` or `log_prob_threshold`.
+            compression_ratio_threshold: If the gzip compression ratio is above this value,
+                treat as failed.
+            log_prob_threshold: If the average log probability over sampled tokens is
+                below this value, treat as failed.
+            log_prob_low_threshold: This parameter alone is sufficient to skip an output text,
+            wheras log_prob_threshold also looks for appropriate no_speech_threshold value.
+            This value should be less than log_prob_threshold.
+            no_speech_threshold: If the no_speech probability is higher than this value AND
+                the average log probability over sampled tokens is below `log_prob_threshold`,
+                consider the segment as silent.
+            initial_prompt: Optional text string or iterable of token ids to provide as a
+                prompt for the first window.
+            prefix: Optional text to provide as a prefix for the first window.
+            suppress_blank: Suppress blank outputs at the beginning of the sampling.
+            suppress_tokens: List of token IDs to suppress. -1 will suppress a default set
+                of symbols as defined in the model config.json file.
+            enable_ta_fe: Use torch audio based kaldi fbank features for faster feature extraction.
+            prepend_punctuations: If word_timestamps is True, merge these punctuation symbols
+                with the next word
+            append_punctuations: If word_timestamps is True, merge these punctuation symbols
+                with the previous word
+            max_new_tokens: Maximum number of new tokens to generate per-chunk. If not set,
+                the maximum will be set by the default max_length.
+            clip_timestamps:
+                Comma-separated list start,end,start,end,... timestamps (in seconds) of clips to
+                process. The last end timestamp defaults to the end of the file.
+            hotwords:
+                Hotwords/hint phrases to the model. Has no effect if prefix is not None.
+
+        Static params: (Fixed for batched version)
+            without_timestamps: Only sample text tokens, set as True.
+            max_initial_timestamp: The initial timestamp cannot be later than this, set at 0.0.
+            word_timestamps: Extract word-level timestamps using the cross-attention pattern
+                and dynamic time warping, and include the timestamps for each word in each segment.
+                Set as False.
+            multilingual: If True, perform transcription on multilingual videos. Set as False.
+            output_language: Valid only if multilingual is set to True.
+                Specifies the string representing the output language. One of
+                'en' (English) or 'hybrid' (code-switched transcription). set as None.
+            condition_on_previous_text: If True, the previous output of the model is provided
+                as a prompt for the next window; disabling may make the text inconsistent across
+                windows, but the model becomes less prone to getting stuck in a failure loop,
+                such as repetition looping or timestamps going out of sync. Set as False
+            prompt_reset_on_temperature: Resets prompt if temperature is above this value.
+                Arg has effect only if condition_on_previous_text is True. Set at 0.5
+            hallucination_silence_threshold: Optional[float]
+                When word_timestamps is True, skip silent periods longer than this threshold
+                (in seconds) when a possible hallucination is detected. set as None.
+
+        unused:
+            language_detection_threshold: If the maximum probability of the language tokens is
+                higher than this value, the language is detected.
+            language_detection_segments: Number of segments to consider for the language detection.
+            vad_filter: Enable the voice activity detection (VAD) to filter out parts of the audio
+                without speech. This step is using the Silero VAD model
+                https://github.com/snakers4/silero-vad.
+            vad_parameters: Dictionary of Silero VAD parameters or VadOptions class (see available
+                parameters and default values in the class `VadOptions`).
+            chunk_length: The length of audio segments. If it is not None, it will overwrite the
+                default chunk_length of the FeatureExtractor.
+
+
+        Returns:
+          A tuple with:
+
+            - a generator over transcribed batched segments.
+            - an instance of TranscriptionInfo.
+            - a dictionary with detected language and its probability.
+        """
+
+        sampling_rate = self.model.feature_extractor.sampling_rate
+
+        if isinstance(audio, str):
+            audio = decode_audio(audio)
+
+        # if no segment split is provided, use vad_model and generate segments
+        if not vad_segments:
+            if self.use_vad_model:
+                vad_segments = self.vad_model(
+                    {
+                        "waveform": torch.from_numpy(audio).unsqueeze(0),
+                        "sample_rate": 16000,
+                    }
+                )
+                vad_segments = merge_chunks(
+                    vad_segments,
+                    self.chunk_size,
+                    onset=self.vad_onset,
+                    offset=self.vad_offset,
+                )
+            else:
+                raise RuntimeError(
+                    "No vad segments found. Set 'use_vad_model' to True while loading the model"
+                )
+
+        language, language_probability, task = self.get_language_and_tokenizer(
+            audio, task, language
+        )
+        batch_size = batch_size or self._batch_size
+        total_segments = len(vad_segments)
+
+        # batched options: see the difference with default options in WhisperModel
+        batched_options = TranscriptionOptions(
+            beam_size=beam_size,
+            best_of=best_of,
+            patience=patience,
+            length_penalty=length_penalty,
+            repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            log_prob_threshold=log_prob_threshold,
+            log_prob_low_threshold=log_prob_low_threshold,
+            no_speech_threshold=no_speech_threshold,
+            compression_ratio_threshold=compression_ratio_threshold,
+            temperatures=(
+                temperature if isinstance(temperature, (list, tuple)) else [temperature]
+            ),
+            initial_prompt=initial_prompt,
+            prefix=prefix,
+            suppress_blank=suppress_blank,
+            suppress_tokens=get_suppressed_tokens(self.tokenizer, suppress_tokens),
+            prepend_punctuations=prepend_punctuations,
+            append_punctuations=append_punctuations,
+            max_new_tokens=max_new_tokens,
+            clip_timestamps=clip_timestamps,
+            hotwords=hotwords,
+            hallucination_silence_threshold=None,
+            condition_on_previous_text=False,
+            prompt_reset_on_temperature=0.5,
+            multilingual=False,
+            word_timestamps=False,
+            output_language=None,
+            without_timestamps=True,
+            max_initial_timestamp=0.0,
+        )
+
+        for idx, out in enumerate(
+            self.__call__(
+                self.audio_split(audio, vad_segments, sampling_rate),
+                batch_size=batch_size,
+                num_workers=num_workers,
+                enable_ta_fe=enable_ta_fe,
+                options=batched_options,
+            )
+        ):
+            # inputs, *args, num_workers=None, batch_size=None, **kwargs
+            if log_progress:
+                percent_complete = ((idx + 1) / total_segments) * 100
+                self.model.logger.info(f"Progress: {percent_complete:.2f}%...")
+
+            text = out["text"]
+            if batch_size in [0, 1, None]:
+                text = text[0]
+
+            segments = BatchedSegment(
+                text=text,
+                start=round(vad_segments[idx]["start"], 3),
+                end=round(vad_segments[idx]["end"], 3),
+            )
+
+            info = TranscriptionInfo(
+                language=language,
+                language_probability=language_probability,
+                duration=0.0,
+                duration_after_vad=0.0,
+                transcription_options=batched_options,
+                vad_options=None,
+                all_language_probs=None,
+            )
+            yield segments, info
+
+        # revert the tokenizer if multilingual inference is enabled
+        if self.preset_language is None:
+            self.tokenizer = None
+
+    def detect_language(self, audio: np.ndarray):
+        segment = torch.tensor(
+            self.model.feature_extractor(audio, padding=True)[
+                :, : self.model.feature_extractor.nb_max_frames
+            ]
+        )
+        encoder_output = self.model.encode(segment)
+        results = self.model.model.detect_language(encoder_output)
+        language_token, language_probability = results[0][0]
+        language = language_token[2:-2]
+        self.model.logger.info(
+            f"Detected language: {language} ({language_probability:.2f}) in first 30s of audio..."
+        )
+        return language, language_probability
+
+    def detect_language_multi_segment(
+        self, audio: Union[str, BinaryIO, np.ndarray], params: Optional[dict] = None
+    ):
+        return self.model.detect_language_multi_segment(audio, params)
+
+
 class WhisperModel:
     def __init__(
         self,
@@ -89,7 +644,7 @@ class WhisperModel:
         device: str = "auto",
         device_index: Union[int, List[int]] = 0,
         compute_type: str = "default",
-        cpu_threads: int = 0,
+        cpu_threads: int = 16,
         num_workers: int = 1,
         max_queued_batches: int = 0,
         download_root: Optional[str] = None,
@@ -153,9 +708,12 @@ class WhisperModel:
         if flash_attention:
             print('Initializing Whisper with flash_attention')
 
+        self.device = device
+        # set the random seed to make sure consistency across runs
+        ctranslate2.set_random_seed(42)
         self.model = ctranslate2.models.Whisper(
             model_path,
-            device=device,
+            device=self.device,
             device_index=device_index,
             compute_type=compute_type,
             intra_threads=cpu_threads,
@@ -233,6 +791,7 @@ class WhisperModel:
         ],
         compression_ratio_threshold: Optional[float] = 2.4,
         log_prob_threshold: Optional[float] = -1.0,
+        log_prob_low_threshold: Optional[float] = -2.0,
         no_speech_threshold: Optional[float] = 0.6,
         condition_on_previous_text: bool = True,
         prompt_reset_on_temperature: float = 0.5,
@@ -243,8 +802,11 @@ class WhisperModel:
         without_timestamps: bool = False,
         max_initial_timestamp: float = 1.0,
         word_timestamps: bool = False,
+        enable_ta_fe=False,
         prepend_punctuations: str = "\"'“¿([{-",
         append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
+        multilingual: bool = False,
+        output_language: Optional[str] = None,
         vad_filter: bool = False,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
         max_new_tokens: Optional[int] = None,
@@ -277,6 +839,9 @@ class WhisperModel:
             treat as failed.
           log_prob_threshold: If the average log probability over sampled tokens is
             below this value, treat as failed.
+          log_prob_low_threshold: This parameter alone is sufficient to skip an output text,
+          wheras log_prob_threshold also looks for appropriate no_speech_threshold value.
+          This value should be less than log_prob_threshold.
           no_speech_threshold: If the no_speech probability is higher than this value AND
             the average log probability over sampled tokens is below `log_prob_threshold`,
             consider the segment as silent.
@@ -296,10 +861,18 @@ class WhisperModel:
           max_initial_timestamp: The initial timestamp cannot be later than this.
           word_timestamps: Extract word-level timestamps using the cross-attention pattern
             and dynamic time warping, and include the timestamps for each word in each segment.
+          enable_ta_fe: Use torch audio based kaldi fbank features
+            instead of torch based mel filterbank for faster feature extraction.
           prepend_punctuations: If word_timestamps is True, merge these punctuation symbols
             with the next word
           append_punctuations: If word_timestamps is True, merge these punctuation symbols
             with the previous word
+          multilingual: If True, perform transcription on multilingual videos
+            and return the transcript based
+            on the 'output_language' flag.
+          output_language: Valid only if multilingual is set to True.
+            Specifies the string representing the output language. One of
+            'en' (English) or 'hybrid' (code-switched transcription).
           vad_filter: Enable the voice activity detection (VAD) to filter out parts of the audio
             without speech. This step is using the Silero VAD model
             https://github.com/snakers4/silero-vad.
@@ -327,6 +900,7 @@ class WhisperModel:
             - a generator over transcribed segments
             - an instance of TranscriptionInfo
         """
+
         sampling_rate = self.feature_extractor.sampling_rate
 
         if not isinstance(audio, np.ndarray):
@@ -369,11 +943,21 @@ class WhisperModel:
         else:
             speech_chunks = None
 
-        features = self.feature_extractor(audio, chunk_length=chunk_length)
+        features = self.feature_extractor(
+            audio, enable_ta=enable_ta_fe, chunk_length=chunk_length
+        )
 
         encoder_output = None
         all_language_probs = None
 
+        # setting output_language for multilingual videos
+        if multilingual:
+            if output_language is None:
+                output_language = "en"
+            elif output_language not in ["en", "hybrid"]:
+                raise ValueError("Output language needs to be one of 'en'/'hybrid'.")
+
+        # detecting the language if not provided
         if language is None:
             if not self.model.is_multilingual:
                 language = "en"
@@ -455,6 +1039,7 @@ class WhisperModel:
             repetition_penalty=repetition_penalty,
             no_repeat_ngram_size=no_repeat_ngram_size,
             log_prob_threshold=log_prob_threshold,
+            log_prob_low_threshold=log_prob_low_threshold,
             no_speech_threshold=no_speech_threshold,
             compression_ratio_threshold=compression_ratio_threshold,
             condition_on_previous_text=condition_on_previous_text,
@@ -471,6 +1056,8 @@ class WhisperModel:
             word_timestamps=word_timestamps,
             prepend_punctuations=prepend_punctuations,
             append_punctuations=append_punctuations,
+            multilingual=multilingual,
+            output_language=output_language,
             max_new_tokens=max_new_tokens,
             clip_timestamps=clip_timestamps,
             hallucination_silence_threshold=hallucination_silence_threshold,
@@ -578,6 +1165,31 @@ class WhisperModel:
                 )
 
             previous_tokens = all_tokens[prompt_reset_since:]
+
+            if encoder_output is None:
+                encoder_output = self.encode(segment)
+
+            # Perform language detection at every segment to update task based on output language,
+            # if the language is english, task is transcribe,
+            # else the task is translate to english (default)
+            # or transcribe if 'output_language' is 'hybrid'.
+            if options.multilingual:
+                results = self.model.detect_language(encoder_output)
+                language_token, language_probability = results[0][0]
+                language = language_token[2:-2]
+                if options.output_language == "en" and language != "en":
+                    task = "translate"
+                else:
+                    task = "transcribe"
+
+                # Update tokenizer based on task and language
+                tokenizer = Tokenizer(
+                    self.hf_tokenizer,
+                    self.model.is_multilingual,
+                    task=task,
+                    language=language,
+                )
+            # Update prompt based on task and language
             prompt = self.get_prompt(
                 tokenizer,
                 previous_tokens,
@@ -607,6 +1219,10 @@ class WhisperModel:
                     # don't skip if the logprob is high enough, despite the no_speech_prob
                     should_skip = False
 
+                # Skip if the logprob is very low (below the threshold value),
+                # despite no_speech_prob being low (ex: Too ambiguous outputs)
+                if avg_logprob < options.log_prob_low_threshold:
+                    should_skip = True
                 if should_skip:
                     self.logger.debug(
                         "No speech threshold is met (%f > %f)",
@@ -1180,6 +1796,365 @@ class WhisperModel:
                 words, word_tokens, start_times, end_times, word_probabilities
             )
         ]
+
+    def encode_batch(self, features: torch.Tensor) -> ctranslate2.StorageView:
+        # When the model is running on multiple GPUs, the encoder output should be moved
+        # to the CPU since we don't know which GPU will handle the next job.
+        to_cpu = self.model.device == "cuda" and len(self.model.device_index) > 1
+        if features.device.type != "cpu":  # for GPU pipeline iterator
+            features = features.cpu().numpy()
+        features = get_ctranslate2_storage(features)
+        return self.model.encode(features, to_cpu=to_cpu)
+
+    def generate_segment_batched(
+        self,
+        features: torch.Tensor,
+        tokenizer: Tokenizer,
+        options: dict,
+        encoder_output=None,
+    ):
+        batch_size = features.shape[0]
+        all_tokens = []
+        prompt_reset_since = 0
+
+        if options["initial_prompt"] is not None:
+            initial_prompt = " " + options["initial_prompt"].strip()
+            initial_prompt_tokens = tokenizer.encode(initial_prompt)
+            all_tokens.extend(initial_prompt_tokens)
+        previous_tokens = all_tokens[prompt_reset_since:]
+        prompt = self.get_prompt(
+            tokenizer,
+            previous_tokens,
+            without_timestamps=options["without_timestamps"],
+            prefix=options["prefix"],
+        )
+
+        encoder_output = self.encode_batch(features)
+
+        result = self.model.generate(
+            encoder_output,
+            [prompt] * batch_size,
+            beam_size=options["beam_size"],
+            patience=options["patience"],
+            length_penalty=options["length_penalty"],
+            max_length=self.max_length,
+            suppress_blank=options["suppress_blank"],
+            suppress_tokens=options["suppress_tokens"],
+        )
+
+        tokens_batch = [x.sequences_ids[0] for x in result]
+
+        def decode_batch(tokens: List[List[int]]) -> str:
+            res = []
+            for tk in tokens:
+                res.append([token for token in tk if token < tokenizer.eot])
+            return tokenizer.tokenizer.decode_batch(res)
+
+        text = decode_batch(tokens_batch)
+        return text
+
+    def detect_language_multi_segment(
+        self, audio: Union[str, BinaryIO, np.ndarray], params: Optional[dict] = None
+    ):
+        """
+        Detect language based on N highly-confident segments of a language.
+        """
+        # The threshold is used to decide if the audio is silence or not.
+        # The default is 0.02 (2.0%) i.e, if more than 2.0% of the audio is silent,
+        # the audio is considered as silence.
+        if not params:
+            params = {
+                "multilingual": False,
+                "speech_percentage_threshold": 0.02,
+                "language_detection_segments": 4,
+                "vad_filter": True,
+                "vad_min_silence_duration": 2500,
+                "enable_ta_fe": False,
+                "language_threshold": 0.7,
+            }
+
+        if params.get("multilingual", False):
+            logging.warning(
+                "lang_id is not supported for multilingual audios, detecting the major language."
+            )
+
+        speech_percentage_threshold = params.get("speech_percentage_threshold", 0.02)
+        language_threshold = params.get("language_threshold", 0.7)
+        num_detection_segments = params.get("language_detection_segments", 4)
+        vad_filter_enabled = params.get("vad_filter", True)
+        vad_params = dict(
+            min_silence_duration_ms=params.get("vad_min_silence_duration", 2500)
+        )
+        enable_ta_fe = params.get("enable_ta_fe", False)
+
+        if vad_filter_enabled:
+            vad_params = VadOptions(**vad_params)
+
+        # decode audio if it is not decoded already
+        sampling_rate = self.feature_extractor.sampling_rate
+        if not isinstance(audio, np.ndarray):
+            audio = decode_audio(audio, sampling_rate=sampling_rate)
+
+        # calculate duration of audio as number of seconds
+        # audio.shape[0] is the number of samples in the audio
+        # sampling_rate is the number of samples per second
+        # if we divide the number of samples by the number of samples per second,
+        # we get the duration in seconds
+        duration = audio.shape[0] / sampling_rate
+
+        # Check if vad is enabled, and collect voiced segments
+        if vad_filter_enabled:
+            # get chunks of audio that contain speech
+            speech_chunks = get_speech_timestamps(audio, vad_params)
+            # merge chunks of audio that contain speech into a single array
+            audio = collect_chunks(audio, speech_chunks)
+
+            # calculate new duration of audio without silence
+            duration_vad = audio.shape[0] / sampling_rate
+
+            logging.debug(
+                f"Lang ID: VAD filter removed {duration - duration_vad} sec of audio"
+            )
+
+            # if the audio after VAD is less than 2% of the original audio, consider it as silence
+            if duration_vad / duration < speech_percentage_threshold:
+                return {"language_code": "silence", "language_confidence": 1.0}
+
+            # update duration to be the duration after VAD
+            duration = duration_vad
+
+        # if the duration of the audio is less than 1 second, consider it as silence
+        if duration < 1.0:
+            return {"language_code": "silence", "language_confidence": 1.0}
+
+        # number of feature frames in 30 seconds of audio is 3000
+        nb_max_frames = self.feature_extractor.nb_max_frames
+
+        # TODO: need to check if it fails for long audios and if we need to split the audio
+
+        # extract features from audio with padding (default)
+        features = self.feature_extractor(audio, enable_ta=enable_ta_fe)
+
+        # number of segments in the audio
+        num_segments = features.shape[-1] // nb_max_frames
+        # more number of segments than possible with the duration of file
+        if num_detection_segments > num_segments:
+            logging.warning(
+                f"Lang ID: Can not have more segments, setting {num_segments} segments."
+            )
+            num_detection_segments = num_segments
+
+        # create a list of indices to randomly select segments from
+        indices = list(range(num_detection_segments))
+
+        # fix seed to get deterministic results
+        random.seed(0)
+        random.shuffle(indices)
+
+        detected_languages = []
+        all_language_probabilities = defaultdict(list)
+        confident_language_probabilities = defaultdict(list)
+        num_confident_segments_per_language = defaultdict(int)
+
+        # Iterate over the randomly selected indices of the segments.
+        #
+        # For each segment, extract features and detect language.
+        #
+        # If the language is confident, add it to the list of confident segments for that language.
+        #
+        # If the number of confident segments for a language
+        # is greater than or equal to the number of detection segments,
+        # return the language and the average probability of the language.
+        #
+        # If we are unable to get sufficient number of confident predcitions,
+        # return the most frequently detected language with maximum probability.
+        #
+        # We need to get sufficient number of confident predictions per language, not in total.
+
+        for i in indices:
+            segment_features = features[:, i * nb_max_frames : (i + 1) * nb_max_frames]
+            try:
+                encoder_output = self.encode(segment_features)
+                results = self.model.detect_language(encoder_output)[0]
+
+            except ValueError as e:  # or RuntimeError
+                logging.error(f"Inference error:{e}")
+
+            # results is the list of classes (languages) and their probabilities (descending),
+            # for eg: [('<|de|>', 0.482177734375),('<|en|>', 0.283447265625),...]
+
+            # take top language token and probability
+            # and parse language token to strip out markers
+            # for eg: '<|de|>' -> 'de'
+
+            language_token = results[0][0]
+            language = language_token[2:-2]
+
+            language_probability = results[0][1]
+
+            detected_languages.append(language)
+            all_language_probabilities[language].append(language_probability)
+
+            # only consider if the language prediction is confident
+            if language_probability > language_threshold:
+                num_confident_segments_per_language[language] += 1
+
+                # Add language and probability to the list of languages when it is confident
+                confident_language_probabilities[language].append(language_probability)
+
+                # return the language when sufficient number of confident segments is achieved
+                if (
+                    num_confident_segments_per_language[language]
+                    >= num_detection_segments
+                ):
+                    # Considering the average probability of only confident segments
+                    return {
+                        "language_code": language,
+                        "language_confidence": np.average(
+                            confident_language_probabilities[language]
+                        ),
+                    }
+
+        # if we are unable to get sufficient number of confident predictions,
+        # return the most frequently detected language.
+        # if there is a tie, return the one with maximum average probability.
+        counter = Counter(detected_languages)
+
+        # Define the key function to select frequent language with attached probabilities
+        def key_func(language):
+            # Calculate the frequency of the language
+            frequency = counter[language]
+
+            # Calculate the average probability of the language
+            prob_avg = sum(all_language_probabilities[language]) / len(
+                all_language_probabilities[language]
+            )
+
+            return (frequency, prob_avg)
+
+        max_language = None
+
+        if detected_languages:
+            # Use the key function to find the language with maximum frequency and probability
+            max_language = max(detected_languages, key=key_func)
+            max_probability = sum(all_language_probabilities[max_language]) / len(
+                all_language_probabilities[max_language]
+            )
+
+            # Do additional checks for silence for non-confident case
+            # calculate RMS amplitude and DC offset
+            dc_offset = np.mean(audio)
+            audio_minus_dc_offset = audio - dc_offset
+            is_silent = (
+                np.all(abs(audio) < 0.01)
+                or np.sqrt(np.mean(audio_minus_dc_offset**2)) < 0.01
+            )
+
+            if is_silent:
+                return {"language_code": "silence", "language_confidence": 1.0}
+
+            if max_language is not None:
+                return {
+                    "language_code": max_language,
+                    "language_confidence": max_probability,
+                }
+
+        # Language is not detected for any segment and none of prev conditions met
+        return {"language_code": "silence", "language_confidence": 1.0}
+
+
+default_batched_asr_options = {
+    "beam_size": 5,
+    "best_of": 5,
+    "patience": 1,
+    "length_penalty": 1,
+    "repetition_penalty": 1,
+    "no_repeat_ngram_size": 0,
+    "temperatures": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+    "compression_ratio_threshold": 2.4,
+    "log_prob_threshold": -1.0,
+    "no_speech_threshold": 0.6,
+    "condition_on_previous_text": False,
+    "prompt_reset_on_temperature": 0.5,
+    "initial_prompt": None,
+    "prefix": None,
+    "suppress_blank": True,
+    "suppress_tokens": [-1],
+    "max_new_tokens": None,
+    "clip_timestamps": "0",
+    "hallucination_silence_threshold": None,
+    "without_timestamps": True,  # False for timings
+    "max_initial_timestamp": 0.0,
+    "word_timestamps": False,
+    "prepend_punctuations": "\"'“¿([{-",
+    "append_punctuations": "\"'.。,，!！?？:：”)]}、",
+    "log_prob_low_threshold": -2.0,
+    "multilingual": False,
+    "output_language": "en",
+    "hotwords": None,
+}
+
+
+def load_model_batch(
+    whisper_arch,
+    device,
+    device_index=0,
+    compute_type="float16",
+    asr_options=None,
+    language: Optional[str] = None,
+    model=None,
+    task="transcribe",
+    download_root=None,
+    threads=4,
+):
+    """Load a Whisper model for inference.
+    Args:
+        whisper_arch: str - The name of the Whisper model to load.
+        device: str - The device to load the model on.
+        compute_type: str - The compute type to use for the model.
+        options: dict - A dictionary of options to use for the model.
+        language: str - The language of the model. (use English for now)
+        download_root: Optional[str] - The root directory to download the model to.
+        threads: int - The number of cpu threads to use per worker.
+    Returns:
+        A Whisper pipeline.
+    """
+
+    if whisper_arch.endswith(".en"):
+        language = "en"
+
+    model = WhisperModel(
+        whisper_arch,
+        device=device,
+        device_index=device_index,
+        compute_type=compute_type,
+        download_root=download_root,
+        cpu_threads=threads,
+    )
+    if language is not None:
+        tokenizer = Tokenizer(
+            model.hf_tokenizer,
+            model.model.is_multilingual,
+            task=task,
+            language=language,
+        )
+    else:
+        model.logger.warning(
+            "No language specified, it will be detected causing increase in inference time."
+        )
+        tokenizer = None
+
+    if asr_options is not None:
+        default_batched_asr_options.update(asr_options)
+
+    batched_asr_options = TranscriptionOptions(**default_batched_asr_options)
+
+    return BatchedInferencePipeline(
+        model=model,
+        options=batched_asr_options,
+        tokenizer=tokenizer,
+        language=language,
+    )
 
 
 def restore_speech_timestamps(
